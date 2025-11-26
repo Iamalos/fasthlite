@@ -65,3 +65,4 @@ data/
 *.xlsx
 project_files/
 projects_files/
+.env
