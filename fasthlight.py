@@ -10,6 +10,8 @@ __all__ = ['data_dir', 'db', 'highlights_db', 'users_db', 'app', 'rt', 'Highligh
 from fasthtml.common import *
 from fasthtml.jupyter import JupyUvi, HTMX
 from monsterui.all import *
+import os
+from dotenv import load_dotenv
 
 # %% fasthlight.ipynb 2
 import fitz  # PyMuPDF
@@ -19,7 +21,7 @@ from collections import Counter
 from typing import Union
 import hashlib
 
-# %% fasthlight.ipynb 4
+# %% fasthlight.ipynb 6
 @dataclass
 class HighlightData:
     text: str
@@ -27,13 +29,13 @@ class HighlightData:
     color: str  # We'll store as string for simplicity
     created: datetime  # ISO format datetime string
 
-# %% fasthlight.ipynb 9
+# %% fasthlight.ipynb 11
 def rgb_to_hex(rgb_tuple):
     """Convert RGB tuple (0-1 range) to hex color string"""
     r, g, b = [int(c * 255) for c in rgb_tuple]
     return f"#{r:02x}{g:02x}{b:02x}"
 
-# %% fasthlight.ipynb 11
+# %% fasthlight.ipynb 13
 def extract_highlights(pdf: Union[str, Path, bytes]):
     """Extract highlights from PDF file path or bytes content"""
     highlights = L()
@@ -70,7 +72,7 @@ def extract_highlights(pdf: Union[str, Path, bytes]):
     
     return highlights
 
-# %% fasthlight.ipynb 16
+# %% fasthlight.ipynb 18
 # Create/open database
 data_dir = Path('/data') if Path('/data').exists() else Path('.')
 data_dir.mkdir(exist_ok=True)
@@ -92,18 +94,18 @@ class Highlight:
 # Create the table (transform=True allows schema updates)
 highlights_db = db.create(Highlight, pk='id', transform=True)
 
-# %% fasthlight.ipynb 18
+# %% fasthlight.ipynb 20
 def pdf_basename(filename):
     """Get filename without extension"""
     return Path(filename).stem
 
-# %% fasthlight.ipynb 20
-def save_highlights(pdf_path, highlights):
+# %% fasthlight.ipynb 22
+def save_highlights(pdf_path, highlights, user_id):
     "Save extracted highlights to database"
     pdf_name = pdf_basename(pdf_path)
     for h in highlights:
         highlights_db.insert(
-            user_id=h.user_id,
+            user_id=user_id,
             text=h.text,
             page=h.page,
             color=h.color,  # Convert tuple to string
@@ -113,7 +115,7 @@ def save_highlights(pdf_path, highlights):
             created=h.created.isoformat()
         )
 
-# %% fasthlight.ipynb 26
+# %% fasthlight.ipynb 28
 def highlight_card(h):
     "Render a highlight card for both PDF and web highlights"
     color_style = f"background-color: {h.color};"
@@ -155,7 +157,7 @@ def highlight_card(h):
         style="position: relative;"
     )
 
-# %% fasthlight.ipynb 28
+# %% fasthlight.ipynb 30
 @dataclass
 class User:
     id: int
@@ -165,13 +167,13 @@ class User:
 
 users_db = db.create(User, pk='id', transform=True)
 
-# %% fasthlight.ipynb 30
+# %% fasthlight.ipynb 32
 def hash_pwd(pwd:str) -> str: return hashlib.sha256(pwd.encode()).hexdigest()
 
-# %% fasthlight.ipynb 32
+# %% fasthlight.ipynb 34
 def verify_pwd(pwd:str, pwd_hash:str) -> bool: return hash_pwd(pwd) == pwd_hash
 
-# %% fasthlight.ipynb 33
+# %% fasthlight.ipynb 35
 def get_current_user(session):
     user_id = session.get('user_id')
     if not user_id: return None
@@ -180,11 +182,14 @@ def get_current_user(session):
     except NotFoundError:
         return None
 
-# %% fasthlight.ipynb 35
+# %% fasthlight.ipynb 37
 # Initialize FastHTML app with MonsterUI theme
-app, rt = fast_app(hdrs=Theme.blue.headers())
+app, rt = fast_app(
+    hdrs=Theme.blue.headers(),
+    secret_key=os.getenv('SECRET_KEY')
+)
 
-# %% fasthlight.ipynb 36
+# %% fasthlight.ipynb 38
 # from starlette.middleware.cors import CORSMiddleware
 
 # app, rt = fast_app(
@@ -199,7 +204,7 @@ app, rt = fast_app(hdrs=Theme.blue.headers())
 #     ]
 # )
 
-# %% fasthlight.ipynb 39
+# %% fasthlight.ipynb 41
 @rt('/')
 def index(request, session):
 
@@ -346,7 +351,7 @@ def index(request, session):
     else:
         return Titled("PDF Highlights Manager", Container(navbar, content, cls='py-8'))  # Full page for direct access
 
-# %% fasthlight.ipynb 40
+# %% fasthlight.ipynb 42
 @rt('/source/{source:path}')
 def view_source(source:str, type:str='pdf'):
     """Unified view for both PDF and web highlights"""
@@ -373,16 +378,22 @@ def view_source(source:str, type:str='pdf'):
         Div(*cards, cls='space-y-4')
     )
 
-# %% fasthlight.ipynb 41
+# %% fasthlight.ipynb 43
 @rt('/upload', methods=['POST'])
-async def upload(pdf_file: UploadFile):
+async def upload(pdf_file: UploadFile, session):
+    user = get_current_user(session)
+    if not user: 
+        return Div(
+            Alert("Please login first to upload PDFs", cls=AlertT.error),
+            RedirectResponse('/login', hx_trigger="load delay:2s")
+        )
+    # return 
     try:
-        
         content = await pdf_file.read()
         new_highlights = extract_highlights(content)
 
         if not new_highlights: return Alert("No highlights found in this PDF", cls=AlertT.warning)
-        save_highlights(pdf_file.filename, new_highlights)
+        save_highlights(pdf_file.filename, new_highlights, user.id)
     
         return Div(
             Alert(
@@ -402,7 +413,7 @@ async def upload(pdf_file: UploadFile):
         
     except Exception as e: return Alert(f"Error: {str(e)}", cls=AlertT.error)
 
-# %% fasthlight.ipynb 43
+# %% fasthlight.ipynb 45
 @rt('/api/highlight', methods=['POST'])
 async def save_web_highlight(text:str, url:str, color:str='#ffff00', title:str='', user_id:int=None):
     """API endpoint for saving web highlights from browser"""
@@ -420,7 +431,7 @@ async def save_web_highlight(text:str, url:str, color:str='#ffff00', title:str='
     )
     return {'status': 'success', 'message': 'Highlight saved!'}
 
-# %% fasthlight.ipynb 45
+# %% fasthlight.ipynb 47
 @rt('/login')
 def login_page():
     """Login page"""
@@ -429,7 +440,7 @@ def login_page():
                       Card(
                           Form(
                               LabelInput("Email", id="email", required=True),
-                              LabelInput("Password", id="password", type='password', required=True),
+                              LabelInput("Password", id="pwd", type='password', required=True),
                               Button("Login", cls=(ButtonT.primary, 'w-full'), type='submit'),
                               hx_post='/login',
                               hx_target="#login-result",
@@ -437,7 +448,7 @@ def login_page():
                           ),
                           Div(id="login-result"),
                           footer=DivCentered(
-                               P("Don't have an account? ", A("Sign up", href='/signup'))
+                               P("Don't have an account? ", A("Sign up", href='/signup', cls=AT.primary))
                           ),
                           header=H3("Welcome Back!")
                   ),
@@ -445,7 +456,7 @@ def login_page():
                   )
                  )
 
-# %% fasthlight.ipynb 46
+# %% fasthlight.ipynb 48
 @rt('/login', methods=['POST'])
 def do_login(email:str, pwd: str, session):
     """Handle login"""
@@ -453,12 +464,16 @@ def do_login(email:str, pwd: str, session):
         user = users_db(where="email=?", where_args=(email,))[0]
         if verify_pwd(pwd, user.pwd_hash):
             session['user_id'] = user.id
-            return Alert("Login successful!", cls=AlertT.success)
+            return Div(
+                Alert("Login successful!", cls=AlertT.success),
+                RedirectResponse()
+            ) 
+            
     except (IndexError, NotFoundError):
         pass
     return Alert("Invalid email or password", cls=AlertT.error)   
 
-# %% fasthlight.ipynb 47
+# %% fasthlight.ipynb 49
 @rt('/signup')
 def signup_page():
     """Signup page"""
@@ -476,7 +491,7 @@ def signup_page():
                 ),
                 Div(id='signup-result'),
                 footer=DivCentered(
-                    P("Already have an account? ", A("Login", href='/login'))
+                    P("Already have an account? ", A("Login", href='/login', cls=AT.primary))
                 ),
                 header=H3("Create Account")
             ),
@@ -484,7 +499,7 @@ def signup_page():
         )
     )
 
-# %% fasthlight.ipynb 48
+# %% fasthlight.ipynb 50
 @rt('/signup', methods=['POST'])
 def do_signup(email: str, password: str, confirm_password: str, session):
     """Handle signup"""
@@ -509,14 +524,14 @@ def do_signup(email: str, password: str, confirm_password: str, session):
     
     return Alert("Account created successfully!", cls=AlertT.success)
 
-# %% fasthlight.ipynb 49
+# %% fasthlight.ipynb 51
 @rt('/logout')
 def logout(session):
     """Logout"""
     session.clear()
     return RedirectResponse('/login', status_code=303)
 
-# %% fasthlight.ipynb 52
+# %% fasthlight.ipynb 54
 @rt('/bookmarklet')
 def bookmarklet_page():
     user = get_current_user(session)
