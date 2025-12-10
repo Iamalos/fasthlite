@@ -6,10 +6,11 @@ __all__ = ['config', 'data_dir', 'db', 'highlights_db', 'users_db', 'ph', 'befor
            'get_user_highlights', 'get_source_highlights', 'get_user_sources', 'delete_highlight', 'get_user_by_email',
            'create_user', 'UploadForm', 'NavBar', 'SourceCard', 'EmptyState', 'BookmarkletCard', 'highlight_card',
            'User', 'hash_pwd', 'verify_pwd', 'get_current_user', 'validate_web_highlight', 'auth_before', 'index',
-           'view_source', 'upload', 'save_web_highlight', 'login_page', 'do_login', 'signup_page', 'do_signup',
-           'logout', 'bookmarklet_page']
+           'view_source', 'upload', 'save_web_highlight', 'login_page', 'redirect_home', 'do_login', 'signup_page',
+           'do_signup', 'logout', 'bookmarklet_page']
 
 # %% fasthlight.ipynb 1
+# fasthtml imports fastcore as well
 from fasthtml.common import *
 from fasthtml.jupyter import JupyUvi, HTMX
 from monsterui.all import *
@@ -22,6 +23,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
 from typing import Union
+from urllib.parse import urlparse
+
+# %% fasthlight.ipynb 3
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError 
+
+# %% fasthlight.ipynb 4
+load_dotenv() 
 
 # %% fasthlight.ipynb 7
 @dataclass
@@ -99,7 +108,7 @@ def extract_highlights(pdf: Union[str, Path, bytes]):
     
     try:
         
-        doc = fitz.open(pdf) if isinstance(pdf, Path) else fits.open(stream=pdf, filetype='pdf')
+        doc = fitz.open(pdf) if isinstance(pdf, Path) else fitz.open(stream=pdf, filetype='pdf')
 
         # check if pdf is encrypted | protected by password
         if doc.is_encrypted: return highlights, "PDF is protected. Please remove the password first."
@@ -190,7 +199,7 @@ def save_highlights(pdf_path, highlights, user_id):
                     created=h.created.isoformat()
                 )
         return True, None
-    except Execption as e: return False, f"Failed to save highlights: {str(e)}"
+    except Exception as e: return False, f"Failed to save highlights: {str(e)}"
 
 # %% fasthlight.ipynb 29
 def save_highlight(user_id, text, source, 
@@ -270,14 +279,12 @@ def delete_highlight(highlight_id, user_id):
     """
     try:
         highlight = highlights_db[highlight_id]
-        if highlight.user != user_id: return False, "Not authorized to delete this highlight"
-        highlight_db.delete(highlight_id)
+        if highlight.user_id != user_id: return False, "Not authorized to delete this highlight"
+        highlights_db.delete(highlight_id)
         return True, None
 
-    except NotFoundError:
-        return False, "Highlight not found"
-    except Exception as e:
-        return False, str(e)
+    except NotFoundError: return False, "Highlight not found"
+    except Exception as e: return False, str(e)
 
 # %% fasthlight.ipynb 34
 def get_user_by_email(email):
@@ -300,7 +307,7 @@ def create_user(email, password):
     except Exception as e: return None, str(e)
 
 # %% fasthlight.ipynb 38
-def UploadForm():\
+def UploadForm():
     return Card(
         Form(
             UploadZone(
@@ -417,7 +424,6 @@ def _get_location_info(h):
         )
     else:
         # Extract domain from URL for cleaner display
-        from urllib.parse import urlparse
         domain = urlparse(h.source).netloc or h.source
         return DivHStacked(
             UkIcon('link', height=16),
@@ -443,7 +449,7 @@ def highlight_card(h):
     
     return Card(
         # Color indicator strip - using inline style instead of Tailwind classes
-        Div(cls="absolute left-0 top-0 bottom-0 w-1", style=color_style),
+        color_strip,
         # Main content with padding to avoid color strip
         Div(
             P(h.text, cls=TextPresets.md_weight_sm),
@@ -493,13 +499,11 @@ def get_current_user(session):
         return None
 
 # %% fasthlight.ipynb 62
-def validate_web_highlight(text, url, title) -> tuple:
+def validate_web_highlight(text, url, color, title) -> tuple:
     """Validate web highlight data
     Returns tuple of (is_valid, error_message, cleaned_data)
     """
     import re
-    from urllib.parse import urlparse
-
     # validate text
     text = text.strip()
     if not text: return False, 'Highlight text cannot be empty', None
@@ -533,10 +537,11 @@ def auth_before(req, sess):
     "Beforeware to check authentification and inject user into request scope"
     # get current user from session
     user = get_current_user(sess)
-
-    req.scope['user'] = user
-    if not user: return RedirectResponse('/login', status_code=303)\
-
+    req.scope['auth'] = user
+    if not user: 
+        print("❌ No user - redirecting to /login")
+        return RedirectResponse('/login', status_code=303)
+    
 beforeware = Beforeware(
     auth_before,
     skip = [
@@ -561,9 +566,9 @@ app, rt = fast_app(
 
 # %% fasthlight.ipynb 68
 @rt('/')
-def index(request, user):
+def index(request):
     """Main dashboard showing all highlight sources"""
-
+    user = request.scope['auth']
     pdf_counts = get_user_sources(user.id, 'pdf')
     web_counts = get_user_sources(user.id, 'web')
 
@@ -571,7 +576,6 @@ def index(request, user):
     web_cards = [SourceCard(source, count, 'web') for source, count in web_counts.items()]
     
     content = Container(
-        Loading(cls=(LoadingT.spinner, LoadingT.lg), htmx_indicator=True),
         Div(
             UploadForm(),
             BookmarkletCard(),
@@ -598,12 +602,13 @@ def index(request, user):
     if 'HX-Request' in request.headers:
         return content  # Just return the content div for HTMX
     else:
-        return Titled("PDF Highlights Manager", Container(navbar, content, cls='py-8'))  # Full page for direct access
+        return Titled("PDF Highlights Manager", Container(NavBar(user), content, cls='py-8'))  # Full page for direct access
 
 # %% fasthlight.ipynb 70
 @rt('/source/{source:path}')
-def view_source(source:str, type:str='pdf', user=None):
+def view_source(request, source:str, type:str='pdf'):
     """Unified view for both PDF and web highlights"""
+    user = request.scope['auth']
     highlights = get_source_highlights(user.id, source, type)
     
     if not highlights:
@@ -627,7 +632,9 @@ def view_source(source:str, type:str='pdf', user=None):
 
 # %% fasthlight.ipynb 72
 @rt('/upload', methods=['POST'])
-async def upload(pdf_file: UploadFile, user):
+async def upload(request, pdf_file: UploadFile):
+    
+    user = request.scope['auth']
     try:
         content = await pdf_file.read()
         new_highlights, error = extract_highlights(content)
@@ -677,11 +684,11 @@ async def save_web_highlight(text:str, url:str, color:str='#ffff00',
         title=data['title']
     )
 
-    if not success: {'status': 'error', 'message': f'Failed to save: {str(e)}'}
+    if not success: return {'status': 'error', 'message': f'Failed to save: {error}'}
     return {'status': 'success', 'message':'Highlight saved!'}
 
 # %% fasthlight.ipynb 77
-@rt('/login')
+@rt('/login',methods=['GET'])
 def login_page():
     """Login page"""
     return Titled("Login",
@@ -706,17 +713,29 @@ def login_page():
                  )
 
 # %% fasthlight.ipynb 78
+@rt('/redirect-home')
+def redirect_home():
+    "Helper route for delayed redirects"
+    return HtmxResponseHeaders(redirect='/')
+
+# %% fasthlight.ipynb 79
 @rt('/login', methods=['POST'])
-def do_login(email:str, pwd: str, session):
+def do_login(email: str, pwd: str, session):
     """Handle login"""
     user = get_user_by_email(email)
+    
     if user and verify_pwd(pwd, user.pwd_hash):
         session['user_id'] = user.id
-        return Alert("Login successful!", cls=AlertT.success)
+        # ✅ Use HX-Redirect header for full page redirect
+        return Div(
+            Alert("Login successful!", cls=AlertT.success),
+            Div(hx_get="/redirect-home",hx_trigger=f'load delay:{config.login_success_delay}s')
+        )
+    
     return Alert("Invalid email or password", cls=AlertT.error)
 
-# %% fasthlight.ipynb 80
-@rt('/signup')
+# %% fasthlight.ipynb 81
+@rt('/signup', methods=['GET'])
 def signup_page():
     """Signup page"""
     return Titled("Sign Up",
@@ -741,32 +760,45 @@ def signup_page():
         )
     )
 
-# %% fasthlight.ipynb 81
+# %% fasthlight.ipynb 82
 @rt('/signup', methods=['POST'])
 def do_signup(email: str, password: str, confirm_password: str, session):
     """Handle signup"""
-
-    if password != confirm_password: return Alert("Passwords don't match", cls=AlertT.error)
+    print("🔵 do_signup() called")  # ← Add this
     
-    if len(password) < config.min_password_length: return Alert("Password must be at least 8 characters", cls=AlertT.warning)
+    if password != confirm_password: 
+        print("❌ Passwords don't match")  # ← Add this
+        return Alert("Passwords don't match", cls=AlertT.error)
+    
+    if len(password) < config.min_password_length: 
+        print("❌ Password too short")  # ← Add this
+        return Alert(f"Password must be at least {config.min_password_length} characters", cls=AlertT.warning)
     
     user, error = create_user(email, password)
-    if not user: return Alert(error, cls=AlertT.error)
+    if not user: 
+        print(f"❌ Create user failed: {error}")  # ← Add this
+        return Alert(error, cls=AlertT.error)
 
     session['user_id'] = user.id
+    print(f"✅ User created: {user.id}")  # ← Add this
     
-    return Alert("Account created successfully!", cls=AlertT.success)
+    return Div(
+        Alert("Account created successfully!", cls=AlertT.success),
+        Div(hx_get="/redirect-home", hx_trigger=f"load delay:{config.login_success_delay}s")
+    )
 
-# %% fasthlight.ipynb 83
+
+# %% fasthlight.ipynb 84
 @rt('/logout')
 def logout(session):
     """Logout"""
     session.clear()
     return RedirectResponse('/login', status_code=303)
 
-# %% fasthlight.ipynb 87
+# %% fasthlight.ipynb 88
 @rt('/bookmarklet')
-def bookmarklet_page(request, user):
+def bookmarklet_page(request):
+    # user = request.scope['auth']
     base_url = str(request.base_url).rstrip('/')
     # JavaScript bookmarklet code
     bookmarklet_js = f"""
@@ -812,7 +844,7 @@ def bookmarklet_page(request, user):
         )
     )
 
-# %% fasthlight.ipynb 92
+# %% fasthlight.ipynb 94
 import os
 
 if __name__ == "__main__":
