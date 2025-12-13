@@ -2,3 +2,5 @@ python-fasthtml
 monsterui
 PyMuPDF
 python-multipart
+argon2
+
