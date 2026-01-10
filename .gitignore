@@ -32,6 +32,11 @@ Thumbs.db       # Windows
 # Ignore logs and debug files
 *.log
 
+# Ignore SSL certificates and keys
+*.pem
+cert.pem
+key.pem
+
 # Ignore virtual machine and container files
 .vagrant/
 *.dockerignore
